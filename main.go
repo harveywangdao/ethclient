@@ -36,11 +36,14 @@ func main() {
 	}
 
 	ipport := cfg.Section("").Key("EthServerIpPort").String()
+	coinbase := cfg.Section("").Key("Coinbase").String()
+	pw := cfg.Section("").Key("Password").String()
+	ks := cfg.Section("").Key("KeyStore").String()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	_, err = test.NewEthClientTest(ipport, &wg)
+	_, err = test.NewEthClientTest(ipport, coinbase, pw, ks, &wg)
 	if err != nil {
 		logger.Error(err)
 		return

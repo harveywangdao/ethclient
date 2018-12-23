@@ -3,7 +3,7 @@ package eth
 import (
 	"context"
 	"crypto/ecdsa"
-	//"encoding/hex"
+	"encoding/json"
 	"errors"
 	"ethclient/logger"
 	"ethclient/store"
@@ -14,70 +14,68 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	//"github.com/ethereum/go-ethereum/crypto/sha3"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"io/ioutil"
 	"math"
 	"math/big"
 	"os"
+	"time"
 )
 
 type EthClient struct {
-	cli         *ethclient.Client
-	password    string
-	keyStoreDir string
+	cli *ethclient.Client
 }
 
-func (e *EthClient) DeployContract(privateKeyHex string) error {
-	privateKey, err := crypto.HexToECDSA(privateKeyHex)
+func (e *EthClient) DeployContract(addressHex, password, keyStoreDir string) (string, error) {
+	address := common.HexToAddress(addressHex)
+	nonce, err := e.cli.PendingNonceAt(context.Background(), address)
 	if err != nil {
 		logger.Error(err)
-		return err
-	}
-
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		logger.Error("error casting public key to ECDSA")
-		return errors.New("error casting public key to ECDSA")
-	}
-
-	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	nonce, err := e.cli.PendingNonceAt(context.Background(), fromAddress)
-	if err != nil {
-		logger.Error(err)
-		return err
+		return "", err
 	}
 
 	gasPrice, err := e.cli.SuggestGasPrice(context.Background())
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
-	auth := bind.NewKeyedTransactor(privateKey)
+	ks := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
+	keyJSON, err := ks.Export(accounts.Account{Address: address}, password, password)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	key, err := keystore.DecryptKey(keyJSON, password)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	auth := bind.NewKeyedTransactor(key.PrivateKey)
 	auth.Nonce = big.NewInt(int64(nonce))
 	auth.Value = big.NewInt(0)     // in wei
 	auth.GasLimit = uint64(300000) // in units
 	auth.GasPrice = gasPrice
 
 	input := "1.0"
-	address, tx, instance, err := store.DeployStore(auth, e.cli, input)
+	contractAddress, tx, instance, err := store.DeployStore(auth, e.cli, input)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
-	logger.Info(address.Hex())
-	logger.Info(tx.Hash().Hex())
+	logger.Info("New contract address:", contractAddress.String())
+	logger.Info("Deploy contract txid:", tx.Hash().String())
 
 	_ = instance
-	return nil
+	return contractAddress.String(), nil
 }
 
 func (e *EthClient) LoadContract(contractAddrHex string) error {
-	address := common.HexToAddress(contractAddrHex)
-	instance, err := store.NewStore(address, e.cli)
+	contractAddr := common.HexToAddress(contractAddrHex)
+	instance, err := store.NewStore(contractAddr, e.cli)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -91,27 +89,14 @@ func (e *EthClient) LoadContract(contractAddrHex string) error {
 		return err
 	}
 
-	logger.Info(version) // "1.0"
+	logger.Info("Contract version:", version) // "1.0"
 
 	return nil
 }
 
-func (e *EthClient) InvokeContract(richPrivKeyHex, contractAddrHex string) error {
-	privateKey, err := crypto.HexToECDSA(richPrivKeyHex)
-	if err != nil {
-		logger.Error(err)
-		return err
-	}
-
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		logger.Error("error casting public key to ECDSA")
-		return errors.New("error casting public key to ECDSA")
-	}
-
-	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	nonce, err := e.cli.PendingNonceAt(context.Background(), fromAddress)
+func (e *EthClient) InvokeContract(addressHex, password, keyStoreDir, contractAddrHex string) error {
+	address := common.HexToAddress(addressHex)
+	nonce, err := e.cli.PendingNonceAt(context.Background(), address)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -123,14 +108,27 @@ func (e *EthClient) InvokeContract(richPrivKeyHex, contractAddrHex string) error
 		return err
 	}
 
-	auth := bind.NewKeyedTransactor(privateKey)
+	ks := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
+	keyJSON, err := ks.Export(accounts.Account{Address: address}, password, password)
+	if err != nil {
+		logger.Error(err)
+		return err
+	}
+
+	tempKey, err := keystore.DecryptKey(keyJSON, password)
+	if err != nil {
+		logger.Error(err)
+		return err
+	}
+
+	auth := bind.NewKeyedTransactor(tempKey.PrivateKey)
 	auth.Nonce = big.NewInt(int64(nonce))
 	auth.Value = big.NewInt(0)     // in wei
 	auth.GasLimit = uint64(300000) // in units
 	auth.GasPrice = gasPrice
 
-	address := common.HexToAddress(contractAddrHex)
-	instance, err := store.NewStore(address, e.cli)
+	contractAddr := common.HexToAddress(contractAddrHex)
+	instance, err := store.NewStore(contractAddr, e.cli)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -147,7 +145,15 @@ func (e *EthClient) InvokeContract(richPrivKeyHex, contractAddrHex string) error
 		return err
 	}
 
-	logger.Info("tx sent:", tx.Hash().Hex())
+	logger.Info("Invoke contract txid:", tx.Hash().String())
+	oldBalance, _ := e.GetBalance(addressHex)
+	for {
+		time.Sleep(2 * time.Second)
+		newBalance, _ := e.GetBalance(addressHex)
+		if newBalance != oldBalance {
+			break
+		}
+	}
 
 	result, err := instance.Items(nil, key)
 	if err != nil {
@@ -155,7 +161,7 @@ func (e *EthClient) InvokeContract(richPrivKeyHex, contractAddrHex string) error
 		return err
 	}
 
-	logger.Info(string(result[:]))
+	logger.Info("After invoke", string(key[:]), ":", string(result[:]))
 
 	return nil
 }
@@ -169,15 +175,13 @@ func (e *EthClient) ToEthValue(num string) string {
 
 func (e *EthClient) GetBalance(addr string) (string, error) {
 	account := common.HexToAddress(addr)
-	logger.Debug("account :", account)
-
 	balance, err := e.cli.BalanceAt(context.Background(), account, nil)
 	if err != nil {
 		logger.Error(err)
 		return "", err
 	}
 
-	logger.Info(addr, "balance :", balance)
+	logger.Info(addr, "balance:", balance.String())
 	//logger.Debug(e.ToEthValue(balance.String()))
 
 	return balance.String(), nil
@@ -213,28 +217,29 @@ func (e *EthClient) GetNewWallet() error {
 	return nil
 }
 
-func (e *EthClient) CreateKeyStore() error {
-	ks := keystore.NewKeyStore(e.keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
+func (e *EthClient) CreateKeyStore(password, keyStoreDir string) (string, error) {
+	ks := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
 
-	account, err := ks.NewAccount(e.password)
+	account, err := ks.NewAccount(password)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
-	logger.Info(account.Address.Hex())
-	return nil
+	logger.Info("Create new address:", account.Address.String())
+
+	return account.Address.String(), nil
 }
 
-func (e *EthClient) ImportKeyStore(file string) error {
-	ks := keystore.NewKeyStore(e.keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
+func (e *EthClient) ImportKeyStore(file, password, keyStoreDir string) error {
+	ks := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
 	jsonBytes, err := ioutil.ReadFile(file)
 	if err != nil {
 		logger.Error(err)
 		return err
 	}
 
-	account, err := ks.Import(jsonBytes, e.password, e.password)
+	account, err := ks.Import(jsonBytes, password, password)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -371,24 +376,19 @@ func (e *EthClient) QueryTransaction(txHex string) error {
 		return err
 	}
 
-	logger.Info(tx.Hash().Hex())
-	logger.Info(tx.Value().String())
-	logger.Info(tx.Gas())
-	logger.Info(tx.GasPrice().Uint64())
-	logger.Info(tx.Nonce())
-	logger.Info(tx.Data())
-	logger.Info(tx.To().Hex())
-	logger.Info(isPending)
+	data, _ := json.Marshal(tx)
+	logger.Info(string(data))
+	logger.Info("Pending:", isPending)
 
 	return nil
 }
 
-func (e *EthClient) Transfer(from, to, num string) error {
+func (e *EthClient) Transfer(from, to, num, password, keyStoreDir string) (string, error) {
 	fromAddress := common.HexToAddress(from)
 	nonce, err := e.cli.PendingNonceAt(context.Background(), fromAddress)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
 	value := new(big.Int)
@@ -397,7 +397,7 @@ func (e *EthClient) Transfer(from, to, num string) error {
 	gasPrice, err := e.cli.SuggestGasPrice(context.Background())
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
 	toAddress := common.HexToAddress(to)
@@ -407,29 +407,29 @@ func (e *EthClient) Transfer(from, to, num string) error {
 	chainID, err := e.cli.NetworkID(context.Background())
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
-	ks := keystore.NewKeyStore(e.keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
+	ks := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
 	/*	signedTx, err := ks.SignTx(accounts.Account{Address: fromAddress}, tx, chainID)
 		if err != nil {
 			logger.Error(err)
-			return err
+			return "", err
 		}*/
-	signedTx, err := ks.SignTxWithPassphrase(accounts.Account{Address: fromAddress}, e.password, tx, chainID)
+	signedTx, err := ks.SignTxWithPassphrase(accounts.Account{Address: fromAddress}, password, tx, chainID)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
 	err = e.cli.SendTransaction(context.Background(), signedTx)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
 	}
 
-	logger.Info("tx sent:", signedTx.Hash().Hex())
-	return nil
+	logger.Info("Transfer txid:", signedTx.Hash().String())
+	return signedTx.Hash().String(), nil
 }
 
 func (e *EthClient) Transfer2(from, to, num, fromPriv string) error {
@@ -514,8 +514,6 @@ func NewEthClient(ipport string) (*EthClient, error) {
 		logger.Error(err)
 		return nil, err
 	}
-	e.password = "13717064390"
-	e.keyStoreDir = "/home/thomas/eth/data/keystore"
 
 	return e, nil
 }
